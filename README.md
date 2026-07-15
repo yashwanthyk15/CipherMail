@@ -1,4 +1,4 @@
-# Email Security Gateway (ESG)
+# CipherMail
 
 An enterprise-grade Email Security Gateway that intercepts and analyzes emails in real-time to detect phishing, malware, and spam using AI and threat intelligence.
 
