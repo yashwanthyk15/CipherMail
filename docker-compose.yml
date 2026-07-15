@@ -1,0 +1,263 @@
+version: '3.9'
+
+services:
+  # SMTP Gateway - Main email receiver
+  smtp-gateway:
+    build:
+      context: ./services/smtp-gateway
+      dockerfile: Dockerfile
+    container_name: smtp-gateway
+    ports:
+      - "587:587"      # SMTP submission
+      - "25:25"        # SMTP relay
+      - "8003:8000"    # FastAPI health/metrics
+    environment:
+      - ENVIRONMENT=development
+      - LOG_LEVEL=INFO
+      - KAFKA_BROKER=kafka:9092
+      - REDIS_HOST=redis
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=email_gateway
+      - POSTGRES_USER=gateway_user
+      - POSTGRES_PASSWORD=secure_password
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - VIRUSTOTAL_API_KEY=${VIRUSTOTAL_API_KEY}
+    depends_on:
+      - kafka
+      - redis
+      - postgres
+    networks:
+      - gateway
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    volumes:
+      - ./services/smtp-gateway:/app
+    restart: unless-stopped
+
+  # AI Worker - Phishing classification
+  ai-worker:
+    build:
+      context: ./services/ai-worker
+      dockerfile: Dockerfile
+    container_name: ai-worker
+    environment:
+      - ENVIRONMENT=development
+      - KAFKA_BROKER=kafka:9092
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - REDIS_HOST=redis
+    depends_on:
+      - kafka
+      - redis
+    networks:
+      - gateway
+    volumes:
+      - ./services/ai-worker:/app
+    restart: unless-stopped
+
+  # Reputation Worker - URL/hash scanning
+  reputation-worker:
+    build:
+      context: ./services/reputation-worker
+      dockerfile: Dockerfile
+    container_name: reputation-worker
+    environment:
+      - ENVIRONMENT=development
+      - KAFKA_BROKER=kafka:9092
+      - VIRUSTOTAL_API_KEY=${VIRUSTOTAL_API_KEY}
+      - REDIS_HOST=redis
+    depends_on:
+      - kafka
+      - redis
+    networks:
+      - gateway
+    volumes:
+      - ./services/reputation-worker:/app
+    restart: unless-stopped
+    
+  # API / Decision Engine
+  api:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    container_name: api
+    ports:
+      - "8001:8000"
+    environment:
+      - ENVIRONMENT=development
+      - KAFKA_BROKER=kafka:9092
+      - REDIS_HOST=redis
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=email_gateway
+      - POSTGRES_USER=gateway_user
+      - POSTGRES_PASSWORD=secure_password
+    depends_on:
+      - kafka
+      - redis
+      - postgres
+    networks:
+      - gateway
+    volumes:
+      - ./services/api:/app
+    restart: unless-stopped
+
+  # Kafka - Message broker
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    depends_on:
+      - zookeeper
+    networks:
+      - gateway
+    restart: unless-stopped
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    networks:
+      - gateway
+    restart: unless-stopped
+
+  # Redis - Caching & deduplication
+  redis:
+    image: redis:7.0-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - gateway
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # PostgreSQL - Email metadata storage
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: email_gateway
+      POSTGRES_USER: gateway_user
+      POSTGRES_PASSWORD: secure_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+    networks:
+      - gateway
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # React Dashboard
+  dashboard:
+    build:
+      context: ./services/dashboard
+      dockerfile: Dockerfile
+    container_name: dashboard
+    ports:
+      - "3002:3000"
+    environment:
+      - VITE_API_URL=http://localhost:8001
+      - VITE_WS_URL=ws://localhost:8001/api/ws/alerts
+    depends_on:
+      - api
+    networks:
+      - gateway
+    restart: unless-stopped
+
+  # Attack Simulator - Test emails
+  attack-simulator:
+    build:
+      context: ./services/attack-simulator
+      dockerfile: Dockerfile
+    container_name: attack-simulator
+    environment:
+      - SMTP_HOST=smtp-gateway
+      - SMTP_PORT=587
+      - ENVIRONMENT=development
+    depends_on:
+      - smtp-gateway
+    networks:
+      - gateway
+    restart: unless-stopped
+
+  # Monitoring - Prometheus + Grafana
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./services/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - gateway
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: grafana-piechart-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./services/monitoring/grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    networks:
+      - gateway
+    restart: unless-stopped
+
+  # Gmail Connector - Monitors your Gmail inbox
+  gmail-connector:
+    build:
+      context: ./services/gmail-connector
+      dockerfile: Dockerfile
+    container_name: gmail-connector
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - GMAIL_CREDENTIALS_FILE=/app/credentials/credentials.json
+      - GMAIL_TOKEN_FILE=/app/credentials/token.json
+      - GMAIL_POLL_INTERVAL_SECONDS=10
+    volumes:
+      - ./credentials.json:/app/credentials/credentials.json:ro
+      - ./token.json:/app/credentials/token.json:ro
+    depends_on:
+      - kafka
+      - redis
+    networks:
+      - gateway
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  gateway:
+    driver: bridge

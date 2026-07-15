@@ -1,0 +1,47 @@
+name: Deploy to Staging
+
+on:
+  push:
+    branches: [develop]
+
+env:
+  AWS_REGION: us-east-1
+  ENVIRONMENT: staging
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Deploy with Docker Compose on EC2
+        env:
+          EC2_IP: ${{ secrets.STAGING_EC2_IP }}
+          EC2_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$EC2_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H $EC2_IP >> ~/.ssh/known_hosts
+
+          ssh -i ~/.ssh/id_rsa ec2-user@$EC2_IP << 'EOF'
+          cd /opt/email-security-gateway
+          docker-compose -f docker-compose.prod.yml down
+          docker-compose -f docker-compose.prod.yml pull
+          docker-compose -f docker-compose.prod.yml up -d
+          EOF
